@@ -128,10 +128,27 @@ cmd_up() {
         return 0
     fi
 
-    mkdir -p "${TMPDIR}"
+    sleep 1  # Esperar a que el kernel libere recursos
 
-    # --- Limpiar por si acaso ---
-    cmd_down 2>/dev/null || true
+    # 0. Limpieza forzada de cualquier residuo anterior
+    for ns_file in /run/netns/${LAB_PREFIX}-*; do
+        if [[ -f "${ns_file}" ]]; then
+            umount "${ns_file}" 2>/dev/null || true
+            rm -f "${ns_file}" 2>/dev/null || true
+        fi
+    done
+    for ns_try in ${LAB_PREFIX}-client ${LAB_PREFIX}-vps ${LAB_PREFIX}-surfshark; do
+        if [[ -f "/run/netns/${ns_try}" ]]; then
+            umount "/run/netns/${ns_try}" 2>/dev/null || true
+            rm -f "/run/netns/${ns_try}" 2>/dev/null || true
+        fi
+        ip netns del "${ns_try}" 2>/dev/null || true
+    done
+    for veth_file in veth-c veth-v veth-v2 veth-s wg0 wg1; do
+        ip link del "${veth_file}" 2>/dev/null || true
+    done
+    rm -rf "${TMPDIR}"
+    mkdir -p "${TMPDIR}"
 
     # 1. Crear namespaces
     echo "    Creando namespaces..."
@@ -165,12 +182,11 @@ cmd_up() {
     run_in_ns "${NS_SS}" ip link set "${VETH_SS}" up
     run_in_ns "${NS_SS}" ip link set lo up
 
-    # 5. Agregar rutas entre namespaces
-    run_in_ns "${NS_CLIENT}" ip route add 10.99.1.0/24 via 10.99.0.1
-    run_in_ns "${NS_CLIENT}" ip route add 10.2.0.0/24 via 10.99.0.1
-    run_in_ns "${NS_VPS}" ip route add 10.99.0.0/24 dev "${VETH_VS}"
-    run_in_ns "${NS_VPS}" ip route add 10.99.1.0/24 dev "${VETH_VS2}"
-    run_in_ns "${NS_SS}" ip route add 10.99.0.0/24 via 10.99.1.1
+    # 5. Agregar rutas entre namespaces (replace para evitar "File exists")
+    run_in_ns "${NS_CLIENT}" ip route replace 10.99.1.0/24 via 10.99.0.1
+    run_in_ns "${NS_VPS}" ip route replace 10.99.0.0/24 dev "${VETH_VS}"
+    run_in_ns "${NS_VPS}" ip route replace 10.99.1.0/24 dev "${VETH_VS2}"
+    run_in_ns "${NS_SS}" ip route replace 10.99.0.0/24 via 10.99.1.1
 
     # 6. Habilitar IP forwarding en VPS
     run_in_ns "${NS_VPS}" sysctl -w net.ipv4.ip_forward=1 >/dev/null
@@ -188,10 +204,10 @@ cmd_up() {
     SS_PRIV=$(cat "${TMPDIR}/ss_private.key")
     SS_PUB=$(cat "${TMPDIR}/ss_public.key")
 
-    # 8. Configurar wg1 (VPS -> Surfshark simulado)
-    echo "    Configurando wg1 (VPS -> Surfshark)..."
+    # 8. Configurar archivos de configuracion
     run_in_ns "${NS_VPS}" wg genkey > /dev/null  # carga modulo si no existe
-    cat > "${TMPDIR}/wg1-vps.conf" << EOF
+    mkdir -p "${TMPDIR}/vps"
+    cat > "${TMPDIR}/vps/wg1.conf" << EOF
 [Interface]
 PrivateKey = ${VPS_PRIV}
 Address = ${WG1_VPS_IP}
@@ -205,11 +221,8 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 5
 EOF
 
-    run_in_ns "${NS_VPS}" wg-quick up "${TMPDIR}/wg1-vps.conf" 2>&1
-
-    # 9. Configurar wg1 endpoint (Surfshark simulado)
-    echo "    Configurando Surfshark simulado..."
-    cat > "${TMPDIR}/wg1-ss.conf" << EOF
+    mkdir -p "${TMPDIR}/ss"
+    cat > "${TMPDIR}/ss/wg1.conf" << EOF
 [Interface]
 PrivateKey = ${SS_PRIV}
 Address = ${WG1_SS_IP}
@@ -221,11 +234,17 @@ PublicKey = ${VPS_PUB}
 AllowedIPs = 0.0.0.0/0
 EOF
 
-    run_in_ns "${NS_SS}" wg-quick up "${TMPDIR}/wg1-ss.conf" 2>&1
+    # 9. Levantar Surfshark wg1 PRIMERO (para que VPS encuentre el peer al conectar)
+    echo "    Configurando Surfshark simulado..."
+    run_in_ns "${NS_SS}" wg-quick up "${TMPDIR}/ss/wg1.conf" 2>&1
 
-    # 10. Configurar wg0 (VPS server)
+    # 10. Levantar VPS wg1 (Surfshark ya esta escuchando)
+    echo "    Configurando wg1 (VPS -> Surfshark)..."
+    run_in_ns "${NS_VPS}" wg-quick up "${TMPDIR}/vps/wg1.conf" 2>&1
+
+    # 11. Configurar wg0 (VPS server) - incluye peer del cliente
     echo "    Configurando wg0 (VPS server)..."
-    cat > "${TMPDIR}/wg0-vps.conf" << EOF
+    cat > "${TMPDIR}/vps/wg0.conf" << EOF
 [Interface]
 PrivateKey = ${VPS_PRIV}
 Address = ${WG0_SERVER_IP}
@@ -236,7 +255,7 @@ Table = off
 PostUp = ip rule add from 10.8.0.0/24 table wg_clients priority 200 2>/dev/null
 PostUp = ip route add default dev wg1 table wg_clients 2>/dev/null
 PostUp = ip route add 10.8.0.0/24 dev wg0 table wg_clients 2>/dev/null
-PostUp = ip route add blackhole 0.0.0.0/0 table wg_clients metric 999 2>/dev/null
+PostUp = ip route add blackhole 0.0.0.0/0 table wg_clients metric 999
 PostUp = iptables -A FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null
 PostUp = iptables -A FORWARD -i wg1 -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
 PostUp = iptables -t nat -A POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null
@@ -246,20 +265,25 @@ PostDown = ip route flush table wg_clients 2>/dev/null
 PostDown = iptables -D FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null
 PostDown = iptables -D FORWARD -i wg1 -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null
 PostDown = iptables -t nat -D POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null
+
+# Cliente de prueba
+[Peer]
+PublicKey = ${CLIENT_PUB}
+AllowedIPs = 10.8.0.2/32
 EOF
 
-    run_in_ns "${NS_VPS}" wg-quick up "${TMPDIR}/wg0-vps.conf" 2>&1
-
-    # Crear tabla de ruteo auxiliar dentro del VPS
+    # Crear tabla de ruteo auxiliar dentro del VPS (ANTES de wg-quick up, PostUp la necesita)
     run_in_ns "${NS_VPS}" bash -c 'grep -qxF "200 wg_clients" /etc/iproute2/rt_tables 2>/dev/null || echo "200 wg_clients" >> /etc/iproute2/rt_tables'
 
-    # 11. Configurar wg0 cliente
+    run_in_ns "${NS_VPS}" wg-quick up "${TMPDIR}/vps/wg0.conf" 2>&1
+
+    # 12. Configurar wg0 cliente
     echo "    Configurando cliente WireGuard..."
-    cat > "${TMPDIR}/wg0-client.conf" << EOF
+    mkdir -p "${TMPDIR}/client"
+    cat > "${TMPDIR}/client/wg0.conf" << EOF
 [Interface]
 PrivateKey = ${CLIENT_PRIV}
 Address = ${WG0_CLIENT_IP}
-DNS = 10.8.0.1
 MTU = 1380
 
 [Peer]
@@ -269,7 +293,10 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 5
 EOF
 
-    run_in_ns "${NS_CLIENT}" wg-quick up "${TMPDIR}/wg0-client.conf" 2>&1
+    run_in_ns "${NS_CLIENT}" wg-quick up "${TMPDIR}/client/wg0.conf" 2>&1
+
+    # Esperar handshakes WireGuard
+    sleep 3
 
     echo ""
     echo "==> Entorno de pruebas creado exitosamente"
@@ -299,10 +326,10 @@ cmd_down() {
         if ip netns list | grep -q "${ns}"; then
             ip netns exec "${ns}" wg-quick down wg0 2>/dev/null || true
             ip netns exec "${ns}" wg-quick down wg1 2>/dev/null || true
-            ip netns exec "${ns}" wg-quick down "${TMPDIR}/wg0-vps.conf" 2>/dev/null || true
-            ip netns exec "${ns}" wg-quick down "${TMPDIR}/wg1-vps.conf" 2>/dev/null || true
-            ip netns exec "${ns}" wg-quick down "${TMPDIR}/wg0-client.conf" 2>/dev/null || true
-            ip netns exec "${ns}" wg-quick down "${TMPDIR}/wg1-ss.conf" 2>/dev/null || true
+            ip netns exec "${ns}" wg-quick down "${TMPDIR}/vps/wg0.conf" 2>/dev/null || true
+            ip netns exec "${ns}" wg-quick down "${TMPDIR}/vps/wg1.conf" 2>/dev/null || true
+            ip netns exec "${ns}" wg-quick down "${TMPDIR}/client/wg0.conf" 2>/dev/null || true
+            ip netns exec "${ns}" wg-quick down "${TMPDIR}/ss/wg1.conf" 2>/dev/null || true
         fi
     done
 
