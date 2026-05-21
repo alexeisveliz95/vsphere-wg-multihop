@@ -15,6 +15,7 @@ set -euo pipefail
 #   status             Dashboard
 #   watchdog           Auto-reparación (correr via cron)
 #   uninstall          Revierte TODO
+#   recover            Recuperación de emergencia (restaura iptables + limpia WG)
 #   test               Auto-test en namespaces aislados
 #
 # Uso:
@@ -30,6 +31,11 @@ SURFSHARK_CONF="${SURFSHARK_CONF:-$(cd "$(dirname "$0")" && pwd)/surfshark.conf}
 MULTIHOP_STATE="${WG_DIR}/.multihop_state"
 DRY_RUN="${DRY_RUN:-0}"
 BATCH="${BATCH:-0}"  # 1 = no interactivo (usa defaults o env vars)
+SSH_PORT="${SSH_PORT:-22}"
+
+# Cargar config persistente de instalaciones anteriores
+WG_PERSIST="${WG_DIR}/.wg-multihop-config"
+[[ -f "$WG_PERSIST" ]] && source "$WG_PERSIST"
 
 # --- Colores ---
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -100,11 +106,80 @@ run_wg_quick() {
 }
 
 # ============================================================================
+# Pre-flight y validación
+# ============================================================================
+
+__preflight() {
+    [[ "$BATCH" == "1" ]] && { log "Modo batch — saltando preflight"; return 0; }
+    local errors=0
+    info "Verificando conectividad..."
+    ping -c 1 -W 3 8.8.8.8 &>/dev/null || { warn "Sin internet (8.8.8.8 inalcanzable)"; errors=1; }
+    ping -c 1 -W 3 1.1.1.1 &>/dev/null || { warn "Sin internet (1.1.1.1 inalcanzable)"; }
+    host github.com &>/dev/null || warn "DNS puede no estar funcionando"
+
+    info "Verificando módulo WireGuard..."
+    if ! lsmod 2>/dev/null | grep -q wireguard; then
+        modprobe wireguard 2>/dev/null || true
+        sleep 1
+        lsmod 2>/dev/null | grep -q wireguard || { err "wireguard.ko no disponible"; errors=1; }
+    fi
+
+    info "Verificando herramientas..."
+    command -v wg &>/dev/null || { err "wg no encontrado — instale wireguard-tools"; errors=1; }
+    command -v wg-quick &>/dev/null || { err "wg-quick no encontrado"; errors=1; }
+    command -v iptables &>/dev/null || { err "iptables no encontrado"; errors=1; }
+
+    info "Verificando rt_tables..."
+    touch /etc/iproute2/rt_tables 2>/dev/null || { err "/etc/iproute2/rt_tables no escribible"; errors=1; }
+
+    info "Verificando interfaces WG existentes..."
+    local conflicts
+    conflicts=$(ip link show 2>/dev/null | grep -oP '^\d+:\s+\K(wg0|wg1)' || true)
+    if [[ -n "$conflicts" ]]; then
+        warn "Interfaces WG ya existen: ${conflicts}"
+        warn "Ejecute 'bash $0 uninstall' primero o quite las interfaces manualmente"
+    fi
+
+    if [[ "$errors" -gt 0 ]]; then
+        err "${errors} cheque(s) de preflight fallaron. Abortando."
+        return 1
+    fi
+    log "Preflight OK"
+}
+
+__validate_surfshark_conf() {
+    [[ "$BATCH" == "1" ]] && return 0
+    local errors=0
+    if [[ -z "${WG1_ENDPOINT:-}" ]]; then
+        err "WG1_ENDPOINT está vacío"; errors=1
+    else
+        local port_part
+        port_part=$(echo "$WG1_ENDPOINT" | cut -d: -f2)
+        if ! [[ "$port_part" =~ ^[0-9]+$ ]] || [[ "$port_part" -lt 1 ]] || [[ "$port_part" -gt 65535 ]]; then
+            err "Puerto inválido en WG1_ENDPOINT (${port_part})"; errors=1
+        fi
+    fi
+    if [[ -z "${SS_PUB:-}" ]]; then
+        err "SS_PUB está vacío"; errors=1
+    elif [[ "${#SS_PUB}" -ne 44 ]]; then
+        err "SS_PUB debe tener 44 caracteres (tiene ${#SS_PUB})"; errors=1
+    fi
+    return $errors
+}
+
+# ============================================================================
 # Internas — instalación
 # ============================================================================
 
 __detect_wan() {
-    ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1 || echo "eth0"
+    local iface
+    iface=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    [[ -n "$iface" ]] && { echo "$iface"; return 0; }
+    iface=$(ip route show default 2>/dev/null | grep -oP 'dev \K\S+' | head -1)
+    [[ -n "$iface" ]] && { echo "$iface"; return 0; }
+    iface=$(ip route 2>/dev/null | grep -m1 '^default' | grep -oP 'dev \K\S+')
+    [[ -n "$iface" ]] && { echo "$iface"; return 0; }
+    echo "eth0"
 }
 
 __detect_ip() {
@@ -132,13 +207,17 @@ __install_wireguard() {
 __install_firewall() {
     local wan="$1"
     title "[2/6] Configurando firewall"
+    # Backup iptables actual antes de tocarlas
+    dry mkdir -p /etc/iptables 2>/dev/null || true
+    dry iptables-save > /etc/iptables/rules.v4.pre-wg-multihop 2>/dev/null || true
+    log "Backup guardado en /etc/iptables/rules.v4.pre-wg-multihop"
     log "Aplicando reglas iptables base..."
     dry iptables -P INPUT DROP 2>/dev/null || true
     dry iptables -P FORWARD DROP 2>/dev/null || true
     dry iptables -P OUTPUT ACCEPT 2>/dev/null || true
     dry iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
     dry iptables -A INPUT -i lo -j ACCEPT 2>/dev/null || true
-    dry iptables -A INPUT -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
+    dry iptables -A INPUT -p tcp --dport "${SSH_PORT}" -j ACCEPT 2>/dev/null || true
     dry iptables -A INPUT -p udp --dport "${WG_PORT}" -j ACCEPT 2>/dev/null || true
     dry iptables -A INPUT -p icmp -m limit --limit 10/second -j ACCEPT 2>/dev/null || true
     dry iptables -A FORWARD -i wg0 -o wg1 -j ACCEPT 2>/dev/null || true
@@ -309,6 +388,9 @@ cmd_install() {
     echo "  ╚══════════════════════════════════════╝"
     echo ""
 
+    # Pre-flight checks (no toca nada)
+    __preflight
+
     local WAN_IFACE
     local MULTIHOP_ENABLE="${MULTIHOP_ENABLE:-n}"
     local WD_ENABLE="${WD_ENABLE:-y}"
@@ -319,6 +401,7 @@ cmd_install() {
     prompt WAN_IFACE "Interfaz WAN (detectada: ${WAN_IFACE})" "$WAN_IFACE"
 
     prompt WG_PORT "Puerto WireGuard" "$WG_PORT"
+    prompt SSH_PORT "Puerto SSH" "$SSH_PORT"
 
     prompt MULTIHOP_ENABLE "Habilitar multihop (salida por Surfshark)" "n"
     [[ "$MULTIHOP_ENABLE" =~ ^[Yy] ]] && MULTIHOP_ENABLE=1 || MULTIHOP_ENABLE=0
@@ -334,6 +417,7 @@ cmd_install() {
             [[ -z "${SS_PUB:-}" ]] && prompt SS_PUB "Public key del peer Surfshark" ""
             [[ -z "${WG1_VPS_IP:-}" ]] && prompt WG1_VPS_IP "IP interna wg1 (VPS)" "10.2.0.2/32"
         fi
+        __validate_surfshark_conf || { err "Configuración Surfshark inválida. Abortando."; exit 1; }
     fi
 
     prompt WD_ENABLE "Configurar watchdog (auto-reparación cada 5 min)" "y"
@@ -343,6 +427,7 @@ cmd_install() {
     echo ""
     log "Resumen de cambios:"
     log "  • WireGuard: wg0 en puerto ${WG_PORT}"
+    log "  • SSH: puerto ${SSH_PORT}"
     log "  • Firewall: SSH + WG + ICMP, resto DROP"
     log "  • Multihop: $([ "$MULTIHOP_ENABLE" == "1" ] && echo "ON → Surfshark" || echo "OFF")"
     log "  • Anti-lockout: tabla mgmt (100)"
@@ -350,6 +435,30 @@ cmd_install() {
     echo ""
 
     [[ "$BATCH" == "0" ]] && confirm "Aplicar cambios" "Y" || true
+
+    # Rollback automático si algo falla
+    local install_failed=1
+    local wg0_was_up=0 wg1_was_up=0 rt_tables_modified=0
+    local backup_file="/etc/iptables/rules.v4.pre-wg-multihop"
+
+    cleanup_rollback() {
+        if [[ "$install_failed" == "1" ]]; then
+            warn "Instalación falló — revirtiendo cambios..."
+            if [[ -f "$backup_file" ]]; then
+                iptables-restore < "$backup_file" 2>/dev/null || true
+                log "iptables restauradas desde backup"
+            fi
+            wg-quick down "${WG_DIR}/wg0.conf" 2>/dev/null || true
+            wg-quick down "${WG_DIR}/wg1.conf" 2>/dev/null || true
+            if [[ "$rt_tables_modified" == "1" ]]; then
+                sed -i '/^200 wg_clients/d' /etc/iproute2/rt_tables 2>/dev/null || true
+                sed -i '/^100 mgmt/d' /etc/iproute2/rt_tables 2>/dev/null || true
+            fi
+            warn "Revise los errores arriba y corrija antes de reintentar."
+            warn "Si necesita recuperarse totalmente: bash $0 recover"
+        fi
+    }
+    trap cleanup_rollback EXIT
 
     # Ejecutar (wg1 ANTES que wg0, porque wg0 PostUp referencia wg1)
     __install_wireguard
@@ -362,9 +471,21 @@ cmd_install() {
     __install_wg0
     [[ "$WD_ENABLE" == "1" ]] && __install_watchdog
 
+    # Persistir configuración para futuras ejecuciones
+    dry mkdir -p "$WG_DIR"
+    cat > "${WG_PERSIST}" << EOF
+# wg-multihop configuración persistente
+SSH_PORT="${SSH_PORT}"
+WG_PORT="${WG_PORT}"
+WAN_IFACE="${WAN_IFACE}"
+EOF
+    log "Configuración persistente guardada"
+
+    install_failed=0
     echo ""
     log "  Listo. Tu VPS es servidor WireGuard."
     log "  Para agregar clientes: bash $(basename "$0") add-client <nombre>"
+    log "  Para recuperación de emergencia: bash $(basename "$0") recover"
     echo ""
 }
 
@@ -647,9 +768,43 @@ cmd_uninstall() {
     log "WireGuard Multihop desinstalado"
 }
 
-# ============================================================================
-# Test en namespaces aislados
-# ============================================================================
+cmd_recover() {
+    check_root
+    title "Recuperación de emergencia"
+    local backup_file="/etc/iptables/rules.v4.pre-wg-multihop"
+
+    if [[ -f "$backup_file" ]]; then
+        log "Restaurando iptables desde backup..."
+        iptables-restore < "$backup_file" 2>/dev/null || err "Error restaurando iptables"
+        log "iptables restauradas"
+    else
+        warn "No hay backup de iptables (${backup_file} no existe)"
+        warn "Las políticas de firewall pueden haber cambiado"
+    fi
+
+    log "Deteniendo WireGuard..."
+    wg-quick down "${WG_DIR}/wg0.conf" 2>/dev/null || true
+    wg-quick down "${WG_DIR}/wg1.conf" 2>/dev/null || true
+
+    log "Limpiando tablas de ruteo..."
+    ip rule del from 10.8.0.0/24 table wg_clients 2>/dev/null || true
+    ip route flush table wg_clients 2>/dev/null || true
+    ip route flush table mgmt 2>/dev/null || true
+    sed -i '/^200 wg_clients/d' /etc/iproute2/rt_tables 2>/dev/null || true
+    sed -i '/^100 mgmt/d' /etc/iproute2/rt_tables 2>/dev/null || true
+
+    log "Eliminando cron..."
+    crontab -l 2>/dev/null | grep -v "wg-multihop.sh" | crontab - 2>/dev/null || true
+    rm -f /etc/cron.d/wg-multihop 2>/dev/null || true
+
+    log "Deshabilitando IP forwarding..."
+    sysctl -w net.ipv4.ip_forward=0 >/dev/null 2>&1 || true
+
+    log "Eliminando config persistente..."
+    rm -f "$WG_PERSIST" 2>/dev/null || true
+
+    log "Recuperación completada. El sistema está en estado previo a la instalación."
+}
 
 cmd_test() {
     check_root
@@ -1022,6 +1177,9 @@ main() {
         test)
             cmd_test
             ;;
+        recover)
+            cmd_recover
+            ;;
         *)
             echo ""
             echo "  WireGuard Multihop Toolbox"
@@ -1037,12 +1195,14 @@ main() {
             echo "    status               Dashboard de estado"
             echo "    watchdog             Auto-reparación (via cron)"
             echo "    uninstall            Revertir TODO"
+            echo "    recover              Recuperación de emergencia (restaura iptables + limpia WG)"
             echo "    test                 Auto-test en namespaces"
             echo ""
             echo "  Variables de entorno:"
             echo "    DRY_RUN=1            Modo simulación (sin cambios reales)"
             echo "    BATCH=1              No interactivo (usa defaults)"
             echo "    WG_PORT=51820        Puerto WireGuard"
+            echo "    SSH_PORT=22          Puerto SSH (para firewall)"
             echo ""
             ;;
     esac
