@@ -115,8 +115,8 @@ __detect_ip() {
 __install_wireguard() {
     title "[1/6] Instalando WireGuard"
     log "Instalando paquetes..."
-    dry apt update -qq 2>/dev/null || true
-    dry apt install -y -qq wireguard qrencode iptables-persistent 2>/dev/null || true
+    dry DEBIAN_FRONTEND=noninteractive apt update -qq 2>/dev/null || true
+    dry DEBIAN_FRONTEND=noninteractive apt install -y -qq wireguard qrencode iptables-persistent 2>/dev/null || true
     dry mkdir -p "$WG_DIR"
     if [[ ! -f "${WG_DIR}/vps_private.key" ]]; then
         log "Generando claves del servidor..."
@@ -249,12 +249,11 @@ __install_watchdog() {
     title "[6/6] Watchdog + Cron"
     local script_path
     script_path=$(readlink -f "$0")
-    dry bash -c "(crontab -l 2>/dev/null; echo '*/5 * * * * root bash ${script_path} watchdog >/dev/null 2>&1') | crontab -" 2>/dev/null || {
-        # Si crontab no funciona, crear script en cron.d
-        mkdir -p /etc/cron.d
-        cat > /etc/cron.d/wg-multihop << EOF
-*/5 * * * * root bash ${script_path} watchdog >/dev/null 2>&1
-EOF
+    # Usar /etc/cron.d (formato correcto: incluye usuario root)
+    dry mkdir -p /etc/cron.d
+    dry bash -c "echo '*/5 * * * * root bash ${script_path} watchdog >/dev/null 2>&1' > /etc/cron.d/wg-multihop" 2>/dev/null || {
+        # Fallback: crontab de root (SIN columna usuario)
+        dry bash -c "(crontab -l 2>/dev/null; echo '*/5 * * * * bash ${script_path} watchdog >/dev/null 2>&1') | crontab -" 2>/dev/null || true
     }
     log "Watchdog instalado cada 5 minutos"
 }
@@ -465,18 +464,40 @@ cmd_multihop() {
             err "wg1 no está configurado. Ejecute 'install' primero."
             exit 1
         fi
+        # Quitar ruta directa por WAN (si existe)
+        local wan gw
+        wan=$(__detect_wan)
+        gw=$(ip route show default 2>/dev/null | grep -oP 'via \K\S+' | head -1 || echo "")
+        if [[ -n "$gw" ]]; then
+            dry ip route del default via "$gw" dev "$wan" table wg_clients 2>/dev/null || true
+            dry iptables -t nat -D POSTROUTING -o "$wan" -j MASQUERADE 2>/dev/null || true
+        fi
+        # Activar wg1 + MASQUERADE
         dry wg-quick up "${WG_DIR}/wg1.conf" 2>/dev/null || true
         dry wg set wg1 peer "$peer" endpoint "$(grep -oP 'Endpoint = \K\S+' "${WG_DIR}/wg1.conf" 2>/dev/null)" 2>/dev/null || true
+        dry ip route add default dev wg1 table wg_clients 2>/dev/null || true
         dry iptables -t nat -A POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || true
         echo "ON" > "$MULTIHOP_STATE"
         log "Multihop activado — tráfico de clientes sale por Surfshark"
     elif [[ "$action" == "off" ]]; then
         [[ "$current" == "OFF" ]] && { info "Multihop ya está OFF"; exit 0; }
         log "Desactivando multihop..."
+        local wan gw
+        wan=$(__detect_wan)
+        gw=$(ip route show default 2>/dev/null | grep -oP 'via \K\S+' | head -1 || echo "")
+        # Quitar MASQUERADE de wg1 + cambiar ruta a WAN directa
         dry iptables -t nat -D POSTROUTING -o wg1 -j MASQUERADE 2>/dev/null || true
         dry wg-quick down "${WG_DIR}/wg1.conf" 2>/dev/null || true
-        echo "OFF" > "$MULTIHOP_STATE"
-        log "Multihop desactivado — tráfico de clientes sale por IP directa del VPS"
+        if [[ -n "$gw" ]]; then
+            dry ip route replace default via "$gw" dev "$wan" table wg_clients 2>/dev/null || \
+                dry ip route add default via "$gw" dev "$wan" table wg_clients 2>/dev/null || true
+            dry iptables -t nat -A POSTROUTING -o "$wan" -j MASQUERADE 2>/dev/null || true
+            echo "OFF" > "$MULTIHOP_STATE"
+            log "Multihop desactivado — tráfico de clientes sale por IP directa del VPS (${wan})"
+        else
+            warn "No se detectó gateway WAN — clientes sin internet"
+            echo "OFF" > "$MULTIHOP_STATE"
+        fi
     else
         # toggle
         if [[ "$current" == "ON" ]]; then
